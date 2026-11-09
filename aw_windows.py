@@ -9,14 +9,23 @@ rapports. Ici on monte la partition Windows et on sert sa base sur un second por
 
 L'instance lit la base Windows telle quelle : les catégories et réglages affichés sont
 donc ceux configurés sous Windows, pas ceux de la session Linux.
+
+Avec --fix-gaps, la base Windows est corrigée avant d'être servie : fix-gaps.sh y écrit
+directement, et c'est le seul moment où aucune instance ne la tient ouverte.
+
+    ensure_mounted()  ->  fix_windows_gaps()  ->  windows_server()  ->  rapport
+                          fix-gaps.sh sur la      aw-server-rust
+                          base non servie         sur le port 5702
 """
 
 import os
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
+from aw_fix_gaps import DEFAULT_FIX_GAPS_SCRIPT, fix_gaps_offline
 from aw_log import log_debug, log_error
 from aw_server import AW_SERVER_BINARY, ServerUnreachableError, wait_for_server
 
@@ -59,6 +68,40 @@ def ensure_mounted(mount_point: Path = MOUNT_POINT) -> None:
         raise WindowsDataError(
             f"{mount_point} n'est toujours pas un point de montage après `mount`"
         )
+
+
+def ensure_writable(db_path: Path = WINDOWS_DB_PATH) -> None:
+    """Vérifie que la base Windows peut être réécrite avant d'y lancer la correction.
+
+    sqlite3 crée son journal à côté du fichier : le répertoire doit être inscriptible lui
+    aussi. Sans ce contrôle, l'échec ne remonterait que sous la forme du code retour de
+    fix-gaps.sh, après l'arrêt d'ActivityWatch côté Linux.
+    """
+    if not db_path.is_file():
+        raise WindowsDataError(f"Base ActivityWatch Windows introuvable: {db_path}")
+    if os.access(db_path, os.W_OK) and os.access(db_path.parent, os.W_OK):
+        return
+    raise WindowsDataError(
+        f"Base Windows non inscriptible: {db_path}. "
+        "Un Windows en veille prolongée (ou démarrage rapide actif) laisse le volume NTFS "
+        "sale, que le pilote ne monte alors qu'en lecture seule : démarrer Windows puis "
+        "l'arrêter complètement libère le volume."
+    )
+
+
+def fix_windows_gaps(
+    period_start: datetime,
+    period_end: datetime,
+    db_path: Path = WINDOWS_DB_PATH,
+    script_path: Path = DEFAULT_FIX_GAPS_SCRIPT,
+) -> None:
+    """Comble les trous de la base Windows, à appeler avant windows_server().
+
+    Aucun processus ne sert cette base à ce stade : contrairement au cas Linux, il n'y a
+    ni ActivityWatch à arrêter ni serveur à relancer.
+    """
+    ensure_writable(db_path)
+    fix_gaps_offline(period_start, period_end, db_path=db_path, script_path=script_path)
 
 
 @contextmanager

@@ -147,6 +147,45 @@ class TestFixGapsSequence:
         assert steps == ["stop", "fix", "start", "wait"]
 
 
+class TestFixGapsOffline:
+    """La base Windows n'est servie par personne : ni arrêt ni redémarrage à orchestrer."""
+
+    def test_writes_without_touching_activitywatch(self, monkeypatch, tmp_path):
+        seen = {}
+        monkeypatch.setattr(
+            aw_fix_gaps,
+            "stop_activitywatch",
+            lambda *a, **k: pytest.fail("ActivityWatch ne doit pas être arrêté"),
+        )
+        monkeypatch.setattr(
+            aw_fix_gaps,
+            "start_activitywatch",
+            lambda *a, **k: pytest.fail("aw-qt ne doit pas être relancé"),
+        )
+        monkeypatch.setattr(
+            aw_fix_gaps,
+            "run_fix_gaps",
+            lambda start_ns, end_ns, db_path, script_path: seen.update(
+                bounds=(start_ns, end_ns), db_path=db_path
+            ),
+        )
+        db = tmp_path / "windows.db"
+        start = datetime(2026, 10, 19, 4, 0).astimezone()
+        end = start + timedelta(days=7)
+        aw_fix_gaps.fix_gaps_offline(start, end, db_path=db)
+        assert seen == {
+            "bounds": (aw_fix_gaps.to_ns(start), aw_fix_gaps.to_ns(end)),
+            "db_path": db,
+        }
+
+    def test_an_invalid_period_is_refused(self, tmp_path):
+        db = tmp_path / "windows.db"
+        db.write_bytes(b"SQLite format 3\x00")
+        now = datetime.now().astimezone()
+        with pytest.raises(aw_fix_gaps.FixGapsError, match="inversée"):
+            aw_fix_gaps.fix_gaps_offline(now, now - timedelta(days=1), db_path=db)
+
+
 class TestPeriodMatchesTheReport:
     """La fenêtre corrigée doit être celle que le rapport interroge, pas une approximation."""
 

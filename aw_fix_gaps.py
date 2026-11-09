@@ -12,6 +12,9 @@ Séquence complète :
 
 La fenêtre corrigée est celle que le rapport affiche, bornes comprises : corriger au-delà
 serait du travail inutile, corriger en deçà laisserait des trous dans le résultat.
+
+Une base qu'aucun serveur ne sert — celle de Windows, montée depuis Linux — n'a ni arrêt
+ni redémarrage à orchestrer : fix_gaps_offline() en est la variante réduite à l'écriture.
 """
 
 import subprocess
@@ -107,7 +110,9 @@ def run_fix_gaps(
     if not db_path.is_file():
         raise FixGapsError(f"Base ActivityWatch introuvable: {db_path}")
 
-    # -b : les processus sont déjà arrêtés, on court-circuite la confirmation interactive.
+    # -b : court-circuite la confirmation interactive et le refus d'écrire quand un
+    # aw-server tourne. L'appelant garantit que personne ne sert `db_path` : soit les
+    # processus ont été arrêtés, soit la base est celle d'un autre système.
     command = [
         "bash",
         str(script_path),
@@ -148,6 +153,30 @@ def start_activitywatch() -> None:
         raise FixGapsError(f"Impossible de démarrer aw-qt: {e}") from e
 
 
+def fix_gaps_offline(
+    period_start: datetime,
+    period_end: datetime,
+    db_path: Path,
+    script_path: Path = DEFAULT_FIX_GAPS_SCRIPT,
+) -> None:
+    """Corrige une base qu'aucun processus ne tient ouverte, sans toucher à ActivityWatch.
+
+    `db_path` est obligatoire : l'appeler sur la base locale, servie par aw-server-rust,
+    risquerait de la corrompre. Passer par fix_gaps() dans ce cas.
+    """
+    log_debug(
+        "fix_gaps_offline",
+        f"correction de {db_path} de {period_start.isoformat()} "
+        f"à {period_end.isoformat()}",
+    )
+    run_fix_gaps(
+        to_ns(period_start),
+        to_ns(period_end),
+        db_path=db_path,
+        script_path=script_path,
+    )
+
+
 def fix_gaps(
     period_start: datetime,
     period_end: datetime,
@@ -157,7 +186,9 @@ def fix_gaps(
 ) -> None:
     """Séquence complète : arrêt, correction, redémarrage, attente du serveur.
 
-    `period_start` et `period_end` sont les bornes que le rapport va interroger.
+    `period_start` et `period_end` sont les bornes que le rapport va interroger. Leur
+    conversion précède l'arrêt : une période invalide ne doit pas laisser ActivityWatch
+    éteint.
     """
     start_ns = to_ns(period_start)
     end_ns = to_ns(period_end)

@@ -220,9 +220,9 @@ class TestFormatWorkdays:
         assert aw_report.format_workdays(-9.0 * 3600) == "-1x7.5 + 1.5"
 
     def test_split_matches_the_duration_displayed_next_to_it(self):
-        # format_duration affiche 14.95 h : 1x7.5 + 7.45 doit retomber sur 14.95.
+        # La colonne « h » affiche 14.95 : 1x7.5 + 7.45 doit retomber sur 14.95.
         seconds = 14.95 * 3600
-        assert aw_report.format_duration(seconds).endswith("(14.95 h)")
+        assert aw_report.duration_cells(seconds)[1] == "14.95"
         assert 1 * 7.5 + 7.45 == pytest.approx(14.95)
         assert aw_report.format_workdays(seconds) == "1x7.5 + 7.45"
 
@@ -238,3 +238,31 @@ class TestStopwatchDuration:
 
     def test_returns_zero_without_match(self):
         assert aw_report.stopwatch_duration([{"duration": 5, "data": {}}], "IT") == 0
+
+
+class TestTotalWork:
+    TOTALS = aw_report.ReportTotals(
+        active_sec=0,
+        not_afk_sec=8 * 3600,
+        afk_sec=1 * 3600,
+        category_sec=0.5 * 3600,
+        it_sec=1.5 * 3600,
+    )
+
+    def test_total_is_general_work_plus_it(self):
+        # IT est retiré de General Work puis rajouté : le total revient à présence - Perso.
+        assert self.TOTALS.general_work_sec == 7 * 3600
+        assert self.TOTALS.total_work_sec == 8.5 * 3600
+
+    def test_total_row_follows_it_row(self):
+        rows = aw_report.totals_rows(self.TOTALS, stopwatch_entries=None)
+        labels = [row[0] for row in rows if row is not aw_report.SEPARATOR]
+        assert labels[-2:] == [aw_report.IT_LABEL, "Total"]
+        assert rows[-1][1:] == [
+            *aw_report.duration_cells(8.5 * 3600),
+            aw_report.format_workdays(8.5 * 3600),
+        ]
+
+    def test_total_of_summed_reports_matches_sum_of_totals(self):
+        combined = self.TOTALS + self.TOTALS
+        assert combined.total_work_sec == 2 * self.TOTALS.total_work_sec

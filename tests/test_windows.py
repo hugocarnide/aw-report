@@ -1,11 +1,13 @@
 """Tests de la lecture des données ActivityWatch de Windows depuis Linux.
 
 Ce qui compte pour l'utilisateur : la partition est montée si besoin, l'instance servant
-la base Windows est toujours arrêtée en sortie, et les deux rapports sortent dans l'ordre
-qui ne fait pas tuer cette instance par --fix-gaps.
+la base Windows est toujours arrêtée en sortie, les deux rapports sortent dans l'ordre qui
+ne fait pas tuer cette instance par --fix-gaps, et --fix-gaps corrige les deux bases sur la
+même fenêtre sans jamais écrire dans une base servie.
 """
 
 import subprocess
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -74,6 +76,68 @@ class TestEnsureMounted:
         )
         with pytest.raises(aw_windows.WindowsDataError, match="veille prolongée"):
             aw_windows.ensure_mounted()
+
+
+class TestEnsureWritable:
+    """La correction écrit dans la base : un volume NTFS sale doit être signalé tôt."""
+
+    def test_accepts_a_writable_database(self, windows_paths):
+        _, db = windows_paths
+        aw_windows.ensure_writable(db)
+
+    def test_read_only_mount_gives_an_actionable_error(
+        self, monkeypatch, windows_paths
+    ):
+        _, db = windows_paths
+        monkeypatch.setattr(aw_windows.os, "access", lambda path, mode: False)
+        with pytest.raises(aw_windows.WindowsDataError, match="veille prolongée"):
+            aw_windows.ensure_writable(db)
+
+    def test_read_only_directory_is_refused(self, monkeypatch, windows_paths):
+        """sqlite3 écrit son journal à côté de la base : le répertoire compte aussi."""
+        _, db = windows_paths
+        monkeypatch.setattr(
+            aw_windows.os, "access", lambda path, mode: path != db.parent
+        )
+        with pytest.raises(aw_windows.WindowsDataError, match="non inscriptible"):
+            aw_windows.ensure_writable(db)
+
+    def test_missing_database_is_reported(self, tmp_path):
+        with pytest.raises(aw_windows.WindowsDataError, match="introuvable"):
+            aw_windows.ensure_writable(tmp_path / "absente.db")
+
+
+class TestFixWindowsGaps:
+    def test_corrects_the_windows_database_over_the_given_period(
+        self, monkeypatch, windows_paths
+    ):
+        _, db = windows_paths
+        seen = {}
+        monkeypatch.setattr(
+            aw_windows,
+            "fix_gaps_offline",
+            lambda start, end, db_path, script_path: seen.update(
+                period=(start, end), db_path=db_path
+            ),
+        )
+        start = datetime(2026, 10, 19, 4, 0).astimezone()
+        end = start + timedelta(days=7)
+        aw_windows.fix_windows_gaps(start, end, db_path=db)
+        assert seen == {"period": (start, end), "db_path": db}
+
+    def test_nothing_is_written_when_the_volume_is_read_only(
+        self, monkeypatch, windows_paths
+    ):
+        _, db = windows_paths
+        monkeypatch.setattr(aw_windows.os, "access", lambda path, mode: False)
+        monkeypatch.setattr(
+            aw_windows,
+            "fix_gaps_offline",
+            lambda *a, **k: pytest.fail("la base ne doit pas être réécrite"),
+        )
+        now = datetime.now().astimezone()
+        with pytest.raises(aw_windows.WindowsDataError):
+            aw_windows.fix_windows_gaps(now - timedelta(days=1), now, db_path=db)
 
 
 class TestWindowsServer:
@@ -166,6 +230,11 @@ class TestWindowsServer:
 class TestDualReport:
     """Le flux complet, transposé de aw-win-report-of-linux.ps1."""
 
+    PERIOD = (
+        datetime(2026, 10, 19, 4, 0).astimezone(),
+        datetime(2026, 10, 26, 4, 0).astimezone(),
+    )
+
     @pytest.fixture
     def run_main(self, aw_report, monkeypatch):
         def run(*argv: str) -> list:
@@ -174,11 +243,16 @@ class TestDualReport:
 
             def fake_report(port, args, fix_gaps_enabled):
                 events.append(("report", port, fix_gaps_enabled))
-                return _totals(aw_report, active_sec=3600.0)
+                return _totals(aw_report, active_sec=3600.0), TestDualReport.PERIOD
 
             monkeypatch.setattr(aw_report, "run_report", fake_report)
             monkeypatch.setattr(
                 aw_report, "ensure_mounted", lambda: events.append(("mount",))
+            )
+            monkeypatch.setattr(
+                aw_report,
+                "fix_windows_gaps",
+                lambda start, end: events.append(("fix-windows", start, end)),
             )
 
             class _Server:
@@ -208,6 +282,29 @@ class TestDualReport:
             ("server-down", 5702),
         ]
 
+    def test_both_databases_are_corrected(self, run_main, capsys):
+        """--fix-gaps ne doit pas s'arrêter à la base Linux quand --windows est passé."""
+        events = run_main("--windows", "--fix-gaps")
+        assert ("report", 5600, True) in events
+        assert ("fix-windows", *TestDualReport.PERIOD) in events
+
+    def test_windows_database_is_corrected_before_being_served(self, run_main, capsys):
+        """fix-gaps.sh écrit dans le fichier SQLite : aucune instance ne doit le tenir."""
+        events = run_main("--windows", "--fix-gaps")
+        fix = events.index(("fix-windows", *TestDualReport.PERIOD))
+        assert events.index(("mount",)) < fix < events.index(("server-up", 5702))
+
+    def test_the_corrected_window_is_the_one_reported(self, run_main, capsys):
+        """Corriger une autre fenêtre laisserait des trous dans le rapport Windows."""
+        events = run_main("--windows", "--fix-gaps")
+        assert [e for e in events if e[0] == "fix-windows"] == [
+            ("fix-windows", *TestDualReport.PERIOD)
+        ]
+
+    def test_windows_database_is_untouched_without_the_flag(self, run_main, capsys):
+        events = run_main("--windows")
+        assert not [e for e in events if e[0] == "fix-windows"]
+
     def test_linux_report_runs_before_the_windows_instance_starts(
         self, run_main, capsys
     ):
@@ -216,7 +313,7 @@ class TestDualReport:
         assert events.index(("report", 5600, True)) < events.index(("server-up", 5702))
 
     def test_windows_report_never_triggers_a_fix(self, run_main, capsys):
-        """La base Windows est lue telle quelle, jamais réécrite par la correction."""
+        """La correction a déjà eu lieu : la relancer ici écrirait dans une base servie."""
         events = run_main("--windows", "--fix-gaps")
         assert ("report", 5702, False) in events
 
@@ -226,6 +323,15 @@ class TestDualReport:
 
     def test_nothing_windows_without_the_flag(self, run_main, capsys):
         assert run_main("-p") == [("report", 5600, False)]
+
+
+def _cells(output, label):
+    """Cellules de la ligne du tableau dont la première colonne vaut `label`."""
+    for line in output.splitlines():
+        cells = [cell.strip() for cell in line.strip("│ ").split("│")]
+        if cells and cells[0].strip() == label:
+            return cells[1:]
+    raise AssertionError(f"Aucune ligne {label!r} dans:\n{output}")
 
 
 def _totals(aw_report, **overrides):
@@ -269,11 +375,32 @@ class TestCombinedTotals:
 
     def test_general_work_of_the_sum_equals_the_sum_of_general_works(self, aw_report):
         """Le cumul ne doit pas introduire d'écart avec les lignes affichées au-dessus."""
-        linux = _totals(aw_report, active_sec=3600.0, category_sec=300.0, it_sec=900.0)
-        windows = _totals(aw_report, active_sec=1800.0, category_sec=60.0)
+        linux = _totals(
+            aw_report,
+            not_afk_sec=3600.0,
+            afk_sec=600.0,
+            category_sec=300.0,
+            it_sec=900.0,
+        )
+        windows = _totals(
+            aw_report, not_afk_sec=1800.0, afk_sec=120.0, category_sec=60.0
+        )
         assert (linux + windows).general_work_sec == (
             linux.general_work_sec + windows.general_work_sec
         )
+
+    def test_general_work_is_presence_minus_perso_and_it(self, aw_report):
+        """Base de calcul : Non-AFK + AFK - Perso - IT, le temps actif n'y entre pas."""
+        totals = _totals(
+            aw_report,
+            active_sec=99_999.0,
+            not_afk_sec=3600.0,
+            afk_sec=1800.0,
+            category_sec=600.0,
+            it_sec=300.0,
+        )
+        assert totals.presence_sec == 5400.0
+        assert totals.general_work_sec == 4500.0
 
     def test_total_block_is_printed_after_both_reports(
         self, aw_report, monkeypatch, capsys
@@ -282,8 +409,9 @@ class TestCombinedTotals:
         monkeypatch.setattr(
             aw_report,
             "run_report",
-            lambda port, args, fix_gaps_enabled: _totals(
-                aw_report, active_sec=3600.0, it_sec=600.0
+            lambda port, args, fix_gaps_enabled: (
+                _totals(aw_report, not_afk_sec=3600.0, afk_sec=600.0, it_sec=600.0),
+                (datetime(2026, 10, 19, 4, 0), datetime(2026, 10, 26, 4, 0)),
             ),
         )
         monkeypatch.setattr(aw_report, "ensure_mounted", lambda: None)
@@ -306,9 +434,24 @@ class TestCombinedTotals:
             "=== Total Linux + Windows ==="
         )
         total_block = out[out.index("=== Total Linux + Windows ===") :]
-        # 2 x (3600 actif - 600 IT) = 6000 s = 100 min, et 2 x 600 s d'IT = 20 min.
-        assert "General Work : 100.0 min" in total_block
-        assert "IT : 20.0 min" in total_block
+        # 2 x (3600 non-AFK + 600 AFK - 600 IT) = 7200 s = 120 min, et 2 x 600 s d'IT.
+        assert _cells(total_block, "General Work")[:2] == ["120.00", "2.00"]
+        assert _cells(total_block, "IT")[:2] == ["20.00", "0.33"]
+
+    def test_total_block_shows_the_formula(self, aw_report, capsys):
+        """La formule doit être lisible directement sous le cumul."""
+        aw_report.print_totals(
+            _totals(
+                aw_report,
+                not_afk_sec=3600.0,
+                afk_sec=1800.0,
+                category_sec=600.0,
+                it_sec=300.0,
+            ),
+            stopwatch_entries=None,
+        )
+        out = capsys.readouterr().out
+        assert "= Non-AFK 1.0 h + AFK 0.5 h - Perso 0.17 h - IT 0.08 h" in out
 
     def test_no_stopwatch_detail_in_the_total(self, aw_report, capsys):
         """Les sessions stopwatch sont listées par système, pas dans le cumul."""

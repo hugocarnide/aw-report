@@ -9,10 +9,12 @@ from requests.exceptions import ConnectionError
 
 from aw_fix_gaps import FixGapsError, fix_gaps
 from aw_log import log_debug
+from aw_table import SEPARATOR, render_table
 from aw_windows import (
     DEFAULT_WINDOWS_PORT,
     WindowsDataError,
     ensure_mounted,
+    fix_windows_gaps,
     windows_server,
 )
 
@@ -63,7 +65,8 @@ def parse_args() -> argparse.Namespace:
         default=False,
         action="store_true",
         help="Combler les trous laissés par awatcher avant le rapport "
-        "(arrête ActivityWatch, corrige la base, relance aw-qt)",
+        "(arrête ActivityWatch, corrige la base, relance aw-qt ; "
+        "avec --windows, corrige aussi la base Windows)",
     )
     parser.add_argument(
         "--windows",
@@ -239,17 +242,25 @@ def stopwatch_duration(entries: list[dict], label: str) -> float:
     )
 
 
-def format_duration(seconds: float) -> str:
-    minutes = round(seconds / 60, 2)
-    hours = round(seconds / 3600, 2)
-    return f"{minutes} min ({hours} h)"
+def duration_cells(seconds: float) -> list[str]:
+    """Minutes et heures d'une durée, en cellules séparées.
+
+    Le nombre de décimales est fixe : c'est ce qui aligne la virgule d'une colonne à
+    l'autre une fois les cellules calées à droite.
+    """
+    return [f"{round(seconds / 60, 2):.2f}", f"{round(seconds / 3600, 2):.2f}"]
+
+
+def format_hours(seconds: float) -> str:
+    """Durée en heures seules, pour les termes d'une formule qui doit rester lisible."""
+    return f"{round(seconds / 3600, 2)} h"
 
 
 def format_workdays(seconds: float) -> str:
     """Découpe une durée en journées de travail : 14.95 h -> '1x7.5 + 7.45'.
 
-    Le découpage part des heures déjà arrondies par format_duration pour que
-    journées x 7.5 + reste redonne exactement la valeur affichée à côté.
+    Le découpage part des heures déjà arrondies par duration_cells pour que
+    journées x 7.5 + reste redonne exactement la valeur affichée dans le tableau.
     """
     hours = round(seconds / 3600, 2)
     sign = "-" if hours < 0 else ""
@@ -282,13 +293,27 @@ class ReportTotals:
     it_sec: float
 
     @property
+    def presence_sec(self) -> float:
+        """Temps de présence : les deux statuts du bucket AFK réunis.
+
+        Les périodes AFK sont du temps de travail au même titre que les périodes actives
+        (réunions, lecture, discussions hors écran) : elles comptent dans la base.
+        """
+        return self.not_afk_sec + self.afk_sec
+
+    @property
     def general_work_sec(self) -> float:
-        """Temps actif hors IT et hors Perso.
+        """Temps de travail : présence (Non-AFK + AFK) moins Perso et IT.
 
         Calculé plutôt que stocké : la somme de deux rapports reste ainsi cohérente avec
         la somme de leurs composantes.
         """
-        return self.active_sec - self.it_sec - self.category_sec
+        return self.presence_sec - self.category_sec - self.it_sec
+
+    @property
+    def total_work_sec(self) -> float:
+        """Temps total facturable : General Work plus le temps IT pointé."""
+        return self.general_work_sec + self.it_sec
 
     def __add__(self, other: "ReportTotals") -> "ReportTotals":
         return ReportTotals(
@@ -300,36 +325,78 @@ class ReportTotals:
         )
 
 
-def print_totals(totals: ReportTotals, stopwatch_entries: list[dict] | None) -> None:
-    """Affiche un bloc de résultats. `stopwatch_entries` à None pour un cumul."""
-    print(f"Temps actif (Time active web UI) : {format_duration(totals.active_sec)}")
-    print(f"  Non-AFK : {format_duration(totals.not_afk_sec)}")
-    print(f"  AFK : {format_duration(totals.afk_sec)}")
-    print(f"Catégorie {CATEGORY_NAME} : {format_duration(totals.category_sec)}")
+def totals_rows(
+    totals: ReportTotals, stopwatch_entries: list[dict] | None
+) -> list[list[str] | None]:
+    """Lignes du tableau de résultats, groupées par mesuré / pointé / calculé."""
+    rows: list[list[str] | None] = [
+        ["Temps actif (Time active web UI)", *duration_cells(totals.active_sec), ""],
+        ["  Non-AFK", *duration_cells(totals.not_afk_sec), ""],
+        ["  AFK", *duration_cells(totals.afk_sec), ""],
+        [f"Catégorie {CATEGORY_NAME}", *duration_cells(totals.category_sec), ""],
+    ]
 
     if stopwatch_entries is not None:
+        rows.append(SEPARATOR)
         if not stopwatch_entries:
-            print("Stopwatch : aucune session enregistrée")
+            # Libellé court : il ne doit pas élargir la colonne à lui seul.
+            rows.append(["Stopwatch : aucune session", "", "", ""])
         for entry in stopwatch_entries:
             entry_label = entry["data"].get("label", "(sans label)")
-            print(f"Stopwatch - {entry_label} : {format_duration(entry['duration'])}")
+            rows.append(
+                [f"Stopwatch - {entry_label}", *duration_cells(entry["duration"]), ""]
+            )
 
-    print("--- Work performed ---")
-    print(
-        f"General Work : {format_duration(totals.general_work_sec)} "
-        f"= {format_workdays(totals.general_work_sec)}"
+    rows += [
+        SEPARATOR,
+        [
+            "General Work",
+            *duration_cells(totals.general_work_sec),
+            format_workdays(totals.general_work_sec),
+        ],
+        [IT_LABEL, *duration_cells(totals.it_sec), ""],
+        [
+            "Total",
+            *duration_cells(totals.total_work_sec),
+            format_workdays(totals.total_work_sec),
+        ],
+    ]
+    return rows
+
+
+def print_totals(totals: ReportTotals, stopwatch_entries: list[dict] | None) -> None:
+    """Affiche un bloc de résultats. `stopwatch_entries` à None pour un cumul."""
+    table = render_table(
+        ["Mesure", "min", "h", "Journées"],
+        totals_rows(totals, stopwatch_entries),
+        aligns="<>><",
     )
-    print(f"IT : {format_duration(totals.it_sec)}")
+    for line in table:
+        print(line)
+
+    # La formule est rappelée sous le tableau : elle est la convention de calcul du
+    # rapport, pas une évidence lisible dans les lignes du dessus.
+    print(
+        f"  General Work = Non-AFK {format_hours(totals.not_afk_sec)} "
+        f"+ AFK {format_hours(totals.afk_sec)} "
+        f"- {CATEGORY_NAME} {format_hours(totals.category_sec)} "
+        f"- {IT_LABEL} {format_hours(totals.it_sec)}"
+    )
+    print(
+        f"  Total = General Work {format_hours(totals.general_work_sec)} "
+        f"+ {IT_LABEL} {format_hours(totals.it_sec)}"
+    )
 
 
 def run_report(
     port: int, args: argparse.Namespace, fix_gaps_enabled: bool
-) -> ReportTotals:
+) -> tuple[ReportTotals, tuple[datetime, datetime]]:
     """Édite le rapport pour le serveur écoutant sur `port`.
 
     Le port est explicite plutôt que lu dans `args` : la même fonction sert le serveur
     local et l'instance pointée sur la base Windows. Les agrégats sont retournés pour
-    que l'appelant puisse cumuler plusieurs systèmes.
+    que l'appelant puisse cumuler plusieurs systèmes, et les bornes résolues pour qu'il
+    puisse corriger exactement la fenêtre rapportée sur une autre base.
     """
     client = ActivityWatchClient("script-aw-summary", port=port)
 
@@ -470,7 +537,7 @@ def run_report(
         it_sec=stopwatch_duration(res["stopwatch_by_label"], IT_LABEL),
     )
     print_totals(totals, res["stopwatch_by_label"])
-    return totals
+    return totals, (period_start, period_end)
 
 
 def main() -> None:
@@ -483,16 +550,29 @@ def main() -> None:
     # Le rapport Linux passe en premier : --fix-gaps y fait un `killall aw-server-rust`,
     # qui emporterait l'instance servant la base Windows si elle tournait déjà.
     print(f"=== Usage Linux (port {args.server_port}) ===")
-    linux_totals = run_report(args.server_port, args, fix_gaps_enabled=args.fix_gaps)
+    linux_totals, period = run_report(
+        args.server_port, args, fix_gaps_enabled=args.fix_gaps
+    )
 
     try:
         ensure_mounted()
+        # La correction écrit dans le fichier SQLite : elle doit précéder le démarrage de
+        # l'instance qui le sert. La fenêtre retenue est celle du rapport Linux, les deux
+        # systèmes d'un dual boot partageant les mêmes réglages de début de journée.
+        if args.fix_gaps:
+            fix_windows_gaps(*period)
         with windows_server(args.windows_port) as windows_port:
             print()
             print(f"=== Usage Windows (port {windows_port}) ===")
-            windows_totals = run_report(windows_port, args, fix_gaps_enabled=False)
+            windows_totals, _ = run_report(windows_port, args, fix_gaps_enabled=False)
     except WindowsDataError as e:
         print(f"[ERROR] Données Windows indisponibles: {e}", file=sys.stderr)
+        sys.exit(1)
+    except FixGapsError as e:
+        print(
+            f"[ERROR] Correction des gaps de la base Windows impossible: {e}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     print()
